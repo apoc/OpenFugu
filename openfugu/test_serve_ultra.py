@@ -165,6 +165,36 @@ def test_unknown_path_returns_404():
     print("  PASS  test_unknown_path_returns_404")
 
 
+
+def test_v1_workers_returns_valid_structure():
+    """GET /v1/workers returns valid structure with conductor slot_id=0 before any requests."""
+    import importlib, sys, threading, json, urllib.request
+    from http.server import HTTPServer
+
+    # Fresh import to get clean counter state
+    for key in [k for k in sys.modules if "serve_ultra" in k]:
+        del sys.modules[key]
+
+    import serve_ultra as su
+
+    server = HTTPServer(("127.0.0.1", 0), su.Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3)
+        data = json.loads(resp.read())
+        assert data["model"] == "fugu-ultra", f"unexpected model: {data['model']}"
+        assert isinstance(data["workers"], list), "workers must be a list"
+        # Conductor slot must always appear
+        assert len(data["workers"]) >= 1, "at least conductor slot expected"
+        w0 = data["workers"][0]
+        assert w0["slot_id"] == 0, f"slot 0 must be conductor, got {w0['slot_id']}"
+        assert all(f"lat_h{i}" in w0 for i in range(11)), f"missing lat_hN fields: {list(w0)}"
+    finally:
+        server.shutdown()
+    print("  PASS  test_v1_workers_returns_valid_structure")
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

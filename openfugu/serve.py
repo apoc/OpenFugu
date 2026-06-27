@@ -32,6 +32,99 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mini import (FuguRouter, Coordinator, LiteLLMWorker, MockWorker,
                   DEFAULT_SLOT_LABELS, HEAD_ROWS, HIDDEN)
 
+import threading as _threading, time as _time
+
+# ── Per-slot cumulative counters ─────────────────────────────────────────────────
+# key: slot_id = agent_id % len(slot_models). Updated under _SLOT_LOCK.
+_SLOT_LOCK    = _threading.Lock()
+_slot_hits       = {}  # slot_id -> int
+_slot_prompt_tok = {}  # slot_id -> int
+_slot_compl_tok  = {}  # slot_id -> int
+_slot_latency_ms = {}  # slot_id -> int
+_slot_lat_hist   = {}  # slot_id -> list[int] (11 bins)
+_slot_model_ids  = {}  # slot_id -> str
+_slot_status     = {}  # slot_id -> str
+
+_LAT_BINS = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 15_000, 20_000, 30_000]
+
+
+def _lat_bin(ms: float) -> int:
+    for i, upper in enumerate(_LAT_BINS):
+        if ms < upper:
+            return i
+    return 10
+
+
+def _ensure_slot(slot_id: int, model_id: str) -> None:
+    """Initialise counters for slot_id if first seen. Call while holding _SLOT_LOCK."""
+    if slot_id not in _slot_hits:
+        _slot_hits[slot_id]       = 0
+        _slot_prompt_tok[slot_id] = 0
+        _slot_compl_tok[slot_id]  = 0
+        _slot_latency_ms[slot_id] = 0
+        _slot_lat_hist[slot_id]   = [0] * 11
+        _slot_model_ids[slot_id]  = model_id
+        _slot_status[slot_id]     = "ok"
+
+
+def _record_slot(slot_id: int, model_id: str, lat_ms: float,
+                 prompt_tok: int, compl_tok: int, ok: bool) -> None:
+    with _SLOT_LOCK:
+        _ensure_slot(slot_id, model_id)
+        _slot_hits[slot_id]       += 1
+        _slot_prompt_tok[slot_id] += prompt_tok
+        _slot_compl_tok[slot_id]  += compl_tok
+        _slot_latency_ms[slot_id] += int(lat_ms)
+        _slot_lat_hist[slot_id][_lat_bin(lat_ms)] += 1
+        _slot_status[slot_id] = "ok" if ok else "error"
+
+
+class _InstrumentedWorker:
+    """Wraps any worker callable to record per-slot timing and usage.
+
+    For LiteLLMWorker: re-implements the litellm call to capture usage fields.
+    For MockWorker / LocalPoolWorker: records timing only (token counts = 0).
+    """
+    def __init__(self, inner, slot_labels):
+        self.inner = inner
+        self.slot_labels = slot_labels
+        # Pre-initialise so /v1/workers shows all slots at startup.
+        with _SLOT_LOCK:
+            for sid, mid in enumerate(slot_labels):
+                _ensure_slot(sid, mid)
+
+    def __call__(self, role_name, messages, agent_id):
+        slot_id  = agent_id % len(self.slot_labels)
+        model_id = self.slot_labels[slot_id]
+        t0 = _time.monotonic()
+        ok = True
+        prompt_tok = compl_tok = 0
+        try:
+            if isinstance(self.inner, LiteLLMWorker):
+                kw = dict(
+                    model=self.inner.slot_models[slot_id],
+                    messages=[{"role": m["role"], "content": m["content"]}
+                               for m in messages],
+                    max_tokens=self.inner.max_tokens,
+                    temperature=self.inner.temperature,
+                )
+                if self.inner.api_key:  kw["api_key"]  = self.inner.api_key
+                if self.inner.api_base: kw["api_base"] = self.inner.api_base
+                r = self.inner.litellm.completion(**kw)
+                usage      = getattr(r, "usage", None) or object()
+                prompt_tok = getattr(usage, "prompt_tokens",     0) or 0
+                compl_tok  = getattr(usage, "completion_tokens", 0) or 0
+                result = r.choices[0].message.content or ""
+            else:
+                result = self.inner(role_name, messages, agent_id)
+        except Exception:
+            ok = False
+            raise
+        finally:
+            lat_ms = (_time.monotonic() - t0) * 1_000
+            _record_slot(slot_id, model_id, lat_ms, prompt_tok, compl_tok, ok)
+        return result
+
 ROUTER: FuguRouter | None = None
 WORKER = None
 MODEL_NAME = "fugu"
@@ -71,6 +164,25 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]})
         elif self.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
+        elif self.path == "/v1/workers":
+            with _SLOT_LOCK:
+                workers = []
+                for sid in sorted(_slot_hits):
+                    h = _slot_lat_hist[sid]
+                    workers.append({
+                        "slot_id":          sid,
+                        "model_id":         _slot_model_ids[sid],
+                        "status":           _slot_status[sid],
+                        "hits":             _slot_hits[sid],
+                        "prompt_tokens":    _slot_prompt_tok[sid],
+                        "compl_tokens":     _slot_compl_tok[sid],
+                        "total_latency_ms": _slot_latency_ms[sid],
+                        "lat_h0":  h[0],  "lat_h1":  h[1],  "lat_h2":  h[2],
+                        "lat_h3":  h[3],  "lat_h4":  h[4],  "lat_h5":  h[5],
+                        "lat_h6":  h[6],  "lat_h7":  h[7],  "lat_h8":  h[8],
+                        "lat_h9":  h[9],  "lat_h10": h[10],
+                    })
+            self._send(200, {"model": MODEL_NAME, "workers": workers})
         else:
             self._send(404, {"error": "not found"})
 
@@ -179,6 +291,13 @@ def main():
     else:
         WORKER = MockWorker()
         print("[serve] worker pool: MOCK (no --slot-models / --local-models given)", flush=True)
+
+    # Determine slot labels for instrumentation.
+    if isinstance(WORKER, LiteLLMWorker):
+        _slot_labels = list(WORKER.slot_models)
+    else:
+        _slot_labels = [f"slot-{i}" for i in range(7)]
+    WORKER = _InstrumentedWorker(WORKER, _slot_labels)
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"[serve] Fugu listening on :{args.port} — POST /v1/chat/completions", flush=True)

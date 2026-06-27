@@ -37,6 +37,102 @@ from ultra import (
     _parse_local_specs,  # module-level helper; same package, intentional import
 )
 
+import threading as _threading, time as _time
+
+# ── Conductor slot (slot_id=0) ──────────────────────────────────────────────────
+_COND_LOCK       = _threading.Lock()
+_cond_hits        = 0
+_cond_prompt_tok  = 0
+_cond_compl_tok   = 0
+_cond_latency_ms  = 0
+_cond_lat_hist    = [0] * 11
+_cond_model_id    = ""  # set in main()
+
+# ── DAG execution worker slots (slot_id = internal_agent_id + 1) ───────────────
+_SLOT_LOCK    = _threading.Lock()
+_slot_hits       = {}
+_slot_prompt_tok = {}
+_slot_compl_tok  = {}
+_slot_latency_ms = {}
+_slot_lat_hist   = {}
+_slot_model_ids  = {}
+_slot_status     = {}
+
+_LAT_BINS = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 15_000, 20_000, 30_000]
+
+
+def _lat_bin(ms: float) -> int:
+    for i, upper in enumerate(_LAT_BINS):
+        if ms < upper:
+            return i
+    return 10
+
+
+def _ensure_slot(sid: int, mid: str) -> None:
+    if sid not in _slot_hits:
+        _slot_hits[sid]       = 0
+        _slot_prompt_tok[sid] = 0
+        _slot_compl_tok[sid]  = 0
+        _slot_latency_ms[sid] = 0
+        _slot_lat_hist[sid]   = [0] * 11
+        _slot_model_ids[sid]  = mid
+        _slot_status[sid]     = "ok"
+
+
+def _record_slot(sid: int, mid: str, lat_ms: float,
+                 prompt_tok: int, compl_tok: int, ok: bool) -> None:
+    with _SLOT_LOCK:
+        _ensure_slot(sid, mid)
+        _slot_hits[sid]       += 1
+        _slot_prompt_tok[sid] += prompt_tok
+        _slot_compl_tok[sid]  += compl_tok
+        _slot_latency_ms[sid] += int(lat_ms)
+        _slot_lat_hist[sid][_lat_bin(lat_ms)] += 1
+        _slot_status[sid] = "ok" if ok else "error"
+
+
+class _InstrumentedWorker:
+    """Wraps WORKER; slot_id in /v1/workers = internal_agent_id + 1 (slot 0 = conductor)."""
+    def __init__(self, inner, slot_labels):
+        self.inner       = inner
+        self.slot_labels = slot_labels
+        with _SLOT_LOCK:
+            for i, mid in enumerate(slot_labels):
+                _ensure_slot(i, mid)
+
+    def __call__(self, subtask, messages, agent_id):
+        raw_sid  = agent_id % len(self.slot_labels)
+        model_id = self.slot_labels[raw_sid]
+        t0 = _time.monotonic()
+        ok = True
+        prompt_tok = compl_tok = 0
+        try:
+            if isinstance(self.inner, LiteLLMWorker):
+                kw = dict(
+                    model=self.inner.slot_models[raw_sid],
+                    messages=[{"role": m["role"], "content": m["content"]}
+                               for m in messages],
+                    max_tokens=self.inner.max_tokens,
+                    temperature=self.inner.temperature,
+                )
+                if self.inner.api_key:  kw["api_key"]  = self.inner.api_key
+                if self.inner.api_base: kw["api_base"] = self.inner.api_base
+                r = self.inner.litellm.completion(**kw)
+                usage      = getattr(r, "usage", None) or object()
+                prompt_tok = getattr(usage, "prompt_tokens",     0) or 0
+                compl_tok  = getattr(usage, "completion_tokens", 0) or 0
+                result = r.choices[0].message.content or ""
+            else:
+                result = self.inner(subtask, messages, agent_id)
+        except Exception:
+            ok = False
+            raise
+        finally:
+            _record_slot(raw_sid, model_id,
+                         (_time.monotonic() - t0) * 1_000,
+                         prompt_tok, compl_tok, ok)
+        return result
+
 # Set by main() before the server starts.
 CONDUCTOR_FN = None  # callable(messages: list[dict]) -> str
 WORKER = None  # callable(subtask, messages, agent_id) -> str
@@ -87,6 +183,40 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif self.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
+        elif self.path == "/v1/workers":
+            workers = []
+            # Slot 0: conductor
+            with _COND_LOCK:
+                ch = list(_cond_lat_hist)
+            workers.append({
+                "slot_id": 0, "model_id": _cond_model_id, "status": "ok",
+                "hits": _cond_hits,
+                "prompt_tokens": _cond_prompt_tok,
+                "compl_tokens":  _cond_compl_tok,
+                "total_latency_ms": _cond_latency_ms,
+                "lat_h0": ch[0],  "lat_h1": ch[1],  "lat_h2": ch[2],
+                "lat_h3": ch[3],  "lat_h4": ch[4],  "lat_h5": ch[5],
+                "lat_h6": ch[6],  "lat_h7": ch[7],  "lat_h8": ch[8],
+                "lat_h9": ch[9],  "lat_h10": ch[10],
+            })
+            # Slots 1+: DAG execution workers
+            with _SLOT_LOCK:
+                for raw_sid in sorted(_slot_hits):
+                    h = _slot_lat_hist[raw_sid]
+                    workers.append({
+                        "slot_id":          raw_sid + 1,
+                        "model_id":         _slot_model_ids[raw_sid],
+                        "status":           _slot_status[raw_sid],
+                        "hits":             _slot_hits[raw_sid],
+                        "prompt_tokens":    _slot_prompt_tok[raw_sid],
+                        "compl_tokens":     _slot_compl_tok[raw_sid],
+                        "total_latency_ms": _slot_latency_ms[raw_sid],
+                        "lat_h0": h[0],  "lat_h1": h[1],  "lat_h2": h[2],
+                        "lat_h3": h[3],  "lat_h4": h[4],  "lat_h5": h[5],
+                        "lat_h6": h[6],  "lat_h7": h[7],  "lat_h8": h[8],
+                        "lat_h9": h[9],  "lat_h10": h[10],
+                    })
+            self._send(200, {"model": MODEL_NAME, "workers": workers})
         else:
             self._send(404, {"error": "not found"})
 
@@ -112,7 +242,16 @@ class Handler(BaseHTTPRequestHandler):
             )
 
             # 1. Ask conductor for a 3-list workflow plan
-            completion = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
+            _t_cond = _time.monotonic()
+            try:
+                completion = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
+            finally:
+                _lat_cond_ms = (_time.monotonic() - _t_cond) * 1_000
+                with _COND_LOCK:
+                    global _cond_hits, _cond_latency_ms
+                    _cond_hits        += 1
+                    _cond_latency_ms  += int(_lat_cond_ms)
+                    _cond_lat_hist[_lat_bin(_lat_cond_ms)] += 1
 
             # 2. Parse the 3 lists
             mids, subs, acc = parse_workflow(completion)
@@ -144,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global CONDUCTOR_FN, WORKER, SLOT_LABELS
+    global CONDUCTOR_FN, WORKER, SLOT_LABELS, _cond_model_id
 
     ap = argparse.ArgumentParser(
         description="Serve Fugu-Ultra as one OpenAI-compatible model endpoint."
@@ -220,6 +359,10 @@ def main():
         conductor_model = args.conductor
         CONDUCTOR_FN = lambda msgs: lw.conduct(conductor_model, msgs)
         print(f"[serve_ultra] conductor: litellm {conductor_model}", flush=True)
+
+    _cond_model_id = args.conductor or (args.local_conductor or "conductor")
+    _slot_labels = list(SLOT_LABELS) if SLOT_LABELS else ["slot-0"]
+    WORKER = _InstrumentedWorker(WORKER, _slot_labels)
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(
