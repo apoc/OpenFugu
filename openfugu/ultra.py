@@ -180,11 +180,19 @@ class ConductorExecutor:
                                            model_ids[:self.max_steps], access[:self.max_steps])
         return model_ids, subtasks, access
 
-    def execute(self, model_ids, subtasks, access, verbose=False) -> UltraResult:
+    def execute(self, model_ids, subtasks, access, verbose=False,
+                stream_last_step=None, on_token=None) -> UltraResult:
+        """Execute the DAG.
+
+        stream_last_step: if provided, called instead of self.worker for the
+            final step; must be callable(subtask, messages, agent_id) -> Iterator[str].
+        on_token: called with each token string from stream_last_step.
+        """
         model_ids, subtasks, access = self.validate(model_ids, subtasks, access)
         res = UltraResult(final="", workflow={"model_id": model_ids,
                                               "subtasks": subtasks, "access_list": access})
         outputs: list[str] = []
+        last_idx = len(subtasks) - 1
         for t, (mid, sub) in enumerate(zip(model_ids, subtasks)):
             sees = visible_indices(access, t)
             ctx = ""
@@ -196,7 +204,18 @@ class ConductorExecutor:
             user = (f"USER QUESTION context:\n{ctx}\n\nYour subtask: {sub}"
                     if ctx else f"Your subtask: {sub}")
             mid = int(mid) % len(self.slot_labels)
-            reply = self.worker(sub, [{"role": "user", "content": user}], mid)
+            messages = [{"role": "user", "content": user}]
+
+            if t == last_idx and stream_last_step is not None:
+                reply_parts: list[str] = []
+                for tok in stream_last_step(sub, messages, mid):
+                    if on_token is not None:
+                        on_token(tok)
+                    reply_parts.append(tok)
+                reply = "".join(reply_parts)
+            else:
+                reply = self.worker(sub, messages, mid)
+
             outputs.append(reply)
             res.steps.append(Step(t, mid, sub, sees, reply))
             if verbose:
@@ -229,6 +248,22 @@ class LiteLLMWorker:
 
     def __call__(self, subtask, messages, agent_id):
         return self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
+
+    def _stream_call(self, model, messages):
+        kw = dict(model=model, messages=messages,
+                  max_tokens=self.max_tokens, temperature=self.temperature,
+                  stream=True)
+        if self.api_key:  kw["api_key"]  = self.api_key
+        if self.api_base: kw["api_base"] = self.api_base
+        return self.litellm.completion(**kw)
+
+    def stream(self, subtask: str, messages: list, agent_id: int):
+        """Yield non-empty token strings for agent_id's slot model."""
+        r = self._stream_call(self.slot_models[agent_id % len(self.slot_models)], messages)
+        for chunk in r:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
 
     def conduct(self, model, messages):     # the Conductor call (more tokens)
         old = self.max_tokens; self.max_tokens = 2048
