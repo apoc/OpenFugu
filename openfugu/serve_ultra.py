@@ -133,6 +133,24 @@ class _InstrumentedWorker:
                          prompt_tok, compl_tok, ok)
         return result
 
+    def stream(self, subtask, messages, agent_id):
+        """Streaming variant: records total latency and token count across the call."""
+        raw_sid  = agent_id % len(self.slot_labels)
+        model_id = self.slot_labels[raw_sid]
+        t0 = _time.monotonic()
+        tokens: list[str] = []
+        ok = True
+        try:
+            for tok in self.inner.stream(subtask, messages, raw_sid):
+                tokens.append(tok)
+                yield tok
+        except Exception:
+            ok = False
+            raise
+        finally:
+            lat_ms = (_time.monotonic() - t0) * 1_000
+            _record_slot(raw_sid, model_id, lat_ms, 0, len(tokens), ok)
+
 # Set by main() before the server starts.
 CONDUCTOR_FN = None  # callable(messages: list[dict]) -> str
 WORKER = None  # callable(subtask, messages, agent_id) -> str
@@ -169,6 +187,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
+
+    def _sse_chunk(self, req_id: str, created: int, model: str,
+                   delta: dict, finish_reason=None, usage=None):
+        """Write one OpenAI chat.completion.chunk SSE event and flush."""
+        event: dict = {
+            "id": req_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            event["usage"] = usage
+        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        self.wfile.flush()
 
     def do_GET(self):
         if self.path == "/v1/models":
@@ -233,15 +266,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             query = next(
-                (
-                    m["content"]
-                    for m in reversed(messages)
-                    if m.get("role") == "user"
-                ),
+                (m["content"] for m in reversed(messages) if m.get("role") == "user"),
                 "",
             )
+            stream = bool(req.get("stream", False))
+            model  = req.get("model", MODEL_NAME)
 
-            # 1. Ask conductor for a 3-list workflow plan
+            # ── conductor plan (always buffered) ──────────────────────────────
             _t_cond = _time.monotonic()
             try:
                 completion = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
@@ -249,32 +280,82 @@ class Handler(BaseHTTPRequestHandler):
                 _lat_cond_ms = (_time.monotonic() - _t_cond) * 1_000
                 with _COND_LOCK:
                     global _cond_hits, _cond_latency_ms
-                    _cond_hits        += 1
-                    _cond_latency_ms  += int(_lat_cond_ms)
+                    _cond_hits       += 1
+                    _cond_latency_ms += int(_lat_cond_ms)
                     _cond_lat_hist[_lat_bin(_lat_cond_ms)] += 1
 
-            # 2. Parse the 3 lists
             mids, subs, acc = parse_workflow(completion)
 
-            # 3. No parseable workflow — degrade gracefully rather than 500
-            if not subs:
-                self._send(
-                    200,
-                    _chat_response(completion, req.get("model", MODEL_NAME), 0),
-                    {"X-Fugu-Warning": "no-workflow-parsed"},
-                )
+            if not stream:
+                # ── buffered path (unchanged) ──────────────────────────────────
+                if not subs:
+                    self._send(200, _chat_response(completion, model, 0),
+                               {"X-Fugu-Warning": "no-workflow-parsed"})
+                    return
+                res = ConductorExecutor(WORKER, slot_labels=SLOT_LABELS).execute(mids, subs, acc)
+                self._send(200, _chat_response(res.final, model, len(res.steps)))
                 return
 
-            # 4. Execute the DAG
-            res = ConductorExecutor(WORKER, slot_labels=SLOT_LABELS).execute(
-                mids, subs, acc
-            )
-            self._send(
-                200,
-                _chat_response(
-                    res.final, req.get("model", MODEL_NAME), len(res.steps)
-                ),
-            )
+            # ── SSE streaming path ─────────────────────────────────────────────
+            # Headers sent after planning so X-Fugu-Warning can be a real header.
+            req_id  = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            created = int(_time.time())
+            no_wf   = not subs
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            if no_wf:
+                self.send_header("X-Fugu-Warning", "no-workflow-parsed")
+            self.end_headers()
+
+            try:
+                if no_wf:
+                    self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
+                    words = completion.split()
+                    for i, word in enumerate(words):
+                        self._sse_chunk(req_id, created, model,
+                                        {"content": word if i == 0 else " " + word})
+                    n_words = len(words)
+                else:
+                    self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
+                    tok_count: list[int] = [0]
+
+                    def on_token(tok: str) -> None:
+                        tok_count[0] += 1
+                        self._sse_chunk(req_id, created, model, {"content": tok})
+
+                    has_stream = hasattr(WORKER, "stream")
+                    res = ConductorExecutor(WORKER, slot_labels=SLOT_LABELS).execute(
+                        mids, subs, acc,
+                        stream_last_step=WORKER.stream if has_stream else None,
+                        on_token=on_token,
+                    )
+
+                    if not has_stream:
+                        words = res.final.split()
+                        for i, word in enumerate(words):
+                            self._sse_chunk(req_id, created, model,
+                                            {"content": word if i == 0 else " " + word})
+                        n_words = len(words)
+                    else:
+                        n_words = tok_count[0]
+
+                self._sse_chunk(req_id, created, model, {}, finish_reason="stop",
+                                usage={"prompt_tokens": 0,
+                                       "completion_tokens": n_words,
+                                       "total_tokens": n_words})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            except Exception as e:
+                err = {"error": {"message": str(e), "type": "sidecar_error"}}
+                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
         except Exception as e:
             self._send(500, {"error": str(e)})
 
