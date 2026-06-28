@@ -158,6 +158,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _sse_chunk(self, req_id: str, created: int, model: str,
+                   delta: dict, finish_reason=None, usage=None):
+        """Write one OpenAI chat.completion.chunk SSE event and flush."""
+        event: dict = {
+            "id": req_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            event["usage"] = usage
+        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        self.wfile.flush()
+
     def do_GET(self):
         if self.path == "/v1/models":
             self._send(200, {"object": "list", "data": [
@@ -195,13 +210,52 @@ class Handler(BaseHTTPRequestHandler):
             messages = req.get("messages", [])
             if not messages:
                 self._send(400, {"error": "messages required"}); return
-            # the user query = last user message; coordinator runs the full loop
-            query = next((m["content"] for m in reversed(messages)
-                          if m.get("role") == "user"), "")
+
+            query  = next((m["content"] for m in reversed(messages)
+                           if m.get("role") == "user"), "")
+            stream = bool(req.get("stream", False))
+            model  = req.get("model", MODEL_NAME)
+
+            # Coordinator runs fully buffered — TRINITY cannot predict the final
+            # Worker turn until the Verifier terminates, so streaming mid-run
+            # would corrupt delta.content reconstruction.
             coord = Coordinator(ROUTER, WORKER, max_turns=MAX_TURNS, sample=True)
-            res = coord.run(query, verbose=False)
-            self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
-                                           len(res.turns)))
+            res   = coord.run(query, verbose=False)
+
+            if not stream:
+                self._send(200, _chat_response(res.final, model, len(res.turns)))
+                return
+
+            # SSE path: headers sent after coord.run() — no exception can occur
+            # after end_headers(), keeping error handling clean.
+            req_id  = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            created = int(_time.time())
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            try:
+                self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
+                words = res.final.split()
+                for i, word in enumerate(words):
+                    self._sse_chunk(req_id, created, model,
+                                    {"content": word if i == 0 else " " + word})
+                self._sse_chunk(req_id, created, model, {}, finish_reason="stop",
+                                usage={"prompt_tokens": 0,
+                                       "completion_tokens": len(words),
+                                       "total_tokens": len(words)})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception as e:
+                err = {"error": {"message": str(e), "type": "sidecar_error"}}
+                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
         except Exception as e:
             self._send(500, {"error": str(e)})
 
