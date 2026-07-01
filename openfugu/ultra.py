@@ -244,10 +244,15 @@ class LiteLLMWorker:
                   max_tokens=self.max_tokens, temperature=self.temperature)
         if self.api_key:  kw["api_key"] = self.api_key
         if self.api_base: kw["api_base"] = self.api_base
-        return self.litellm.completion(**kw).choices[0].message.content or ""
+        r = self.litellm.completion(**kw)
+        usage      = getattr(r, "usage", None) or object()
+        prompt_tok = getattr(usage, "prompt_tokens",     0) or 0
+        compl_tok  = getattr(usage, "completion_tokens", 0) or 0
+        return r.choices[0].message.content or "", prompt_tok, compl_tok
 
     def __call__(self, subtask, messages, agent_id):
-        return self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
+        text, _, _ = self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
+        return text
 
     def _stream_call(self, model, messages):
         kw = dict(model=model, messages=messages,
@@ -266,6 +271,10 @@ class LiteLLMWorker:
                 yield content
 
     def conduct(self, model, messages):     # the Conductor call (more tokens)
+        return self.conduct_with_usage(model, messages)[0]
+
+    def conduct_with_usage(self, model, messages):
+        """Like conduct(), but also returns (prompt_tokens, completion_tokens)."""
         old = self.max_tokens; self.max_tokens = 2048
         try:
             return self._call(model, messages)
@@ -291,16 +300,23 @@ class LocalConductor:
             self.model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=torch.bfloat16).to(device).eval()
 
     def conduct(self, messages):              # mirrors LiteLLMWorker.conduct signature use
+        return self.conduct_with_usage(messages)[0]
+
+    def conduct_with_usage(self, messages):
+        """Like conduct(), but also returns (prompt_tokens, completion_tokens)."""
         torch = self.torch
         try:
             text = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
             text = "\n".join(m["content"] for m in messages)
         ids = self.tok(text, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+        prompt_tok = int(ids["input_ids"].shape[1])
         with torch.no_grad():
             out = self.model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
                                       pad_token_id=self.tok.pad_token_id)
-        return self.tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
+        compl_tok = int(out.shape[1] - prompt_tok)
+        text_out = self.tok.decode(out[0, prompt_tok:], skip_special_tokens=True)
+        return text_out, prompt_tok, compl_tok
 
 
 class LocalPoolWorker:

@@ -27,8 +27,8 @@ scripts in this repo — file references are given so you can verify.
 | `--local-models` | Local HF | CSV of paths, optional `@device` | `/models/llama-3.3-8b@cuda:1,/models/gemma-3-27b@cuda:2` |
 
 - Omit both → `MockWorker` (offline stand-in; the dashboard shows mock data).
-- Pool size is **`N_AGENTS = 7`** slots (`openfugu/ultra.py:33`, `openfugu/mini.py`). Provide up to 7 models; if you give fewer, dispatch wraps with `agent_id % len(pool)` (`serve.py:38`).
-- Local device parsing: `path@cuda:N`, else round-robin across GPUs, else `cpu` (`serve.py:278-284`, `ultra.py:_parse_local_specs`).
+- Pool size is **`N_AGENTS = 7`** slots (`openfugu/ultra.py:33`, `openfugu/mini.py`). Provide up to 7 models; if you give fewer, dispatch wraps with `agent_id % len(pool)` (`serve.py:107`, `serve_ultra.py:114`).
+- Local device parsing: `path@cuda:N`, else round-robin across GPUs, else `cpu` (`serve.py:345-354`, `ultra.py:_parse_local_specs`).
 
 ### A.2 litellm IDs for the requested frontier models
 
@@ -48,7 +48,7 @@ run a *heterogeneous* frontier pool behind one key is **OpenRouter** (`openroute
 ¹ "Open 4.8" is read here as **Claude Opus 4.8**. If you meant something else
 (e.g. an OpenAI `o`-series model), swap the ID — the mechanism is identical.
 
-**Credentials** (read by `LiteLLMWorker`, `ultra.py:240-265` / `mini.py:196-224`):
+**Credentials** (read by `LiteLLMWorker`, `ultra.py:230-240` / `mini.py:236-256`):
 
 | Env var | Used for |
 |---|---|
@@ -69,7 +69,7 @@ python openfugu/serve.py \
   --port 8088
 ```
 
-`serve.py` flags (`serve.py:247-304`): `--model` (required, Qwen3-0.6B dir),
+`serve.py` flags (`serve.py:319-332`): `--model` (required, Qwen3-0.6B dir),
 `--vector` (default `model_iter_60.npy`, the 19 456-float base = 9 216 SVF +
 10 240 head), `--head` (optional trained head-only override, 10 240 floats),
 `--slot-models`, `--local-models`, `--port` (8088), `--max-turns` (5).
@@ -93,7 +93,7 @@ python openfugu/serve_ultra.py \
   --port 8089
 ```
 
-`serve_ultra.py` flags (`serve_ultra.py:285-313`): `--conductor` (litellm ID) **or**
+`serve_ultra.py` flags (`serve_ultra.py:390-415`): `--conductor` (litellm ID) **or**
 `--local-conductor` (checkpoint path) — one is required; `--conductor-device`
 (cuda:0), `--slot-models`, `--local-models`, `--port` (8089).
 
@@ -113,8 +113,8 @@ python openfugu/serve_ultra.py \
 | Conductor is a prompted frontier model | No training; just `--conductor <id>` |
 | Want a *small local* conductor to plan workflows | Yes — train on workflow-DSL data (B.2) |
 
-The dashboard's worker cards read `/v1/workers` (`serve.py:158-176`,
-`serve_ultra.py:126-156`), so new slot models appear automatically once served —
+The dashboard's worker cards read `/v1/workers` (`serve.py:186-212`,
+`serve_ultra.py:216-264`), so new slot models appear automatically once served —
 slot 0 on the Ultra side is the Conductor, slots 1+ are workers.
 
 ---

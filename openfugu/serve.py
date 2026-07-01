@@ -23,7 +23,7 @@ Query:
   curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"..."}]}'
 """
 from __future__ import annotations
-import argparse, glob, json, os, sys, time, uuid
+import argparse, glob, json, os, re, sys, time, uuid
 import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -53,6 +53,16 @@ def _lat_bin(ms: float) -> int:
         if ms < upper:
             return i
     return 10
+
+
+def _stream_chunks(text: str) -> tuple[list[str], int]:
+    """Split text into whitespace-preserving chunks for SSE fallback streaming.
+
+    Concatenating the returned chunks reproduces `text` exactly (no whitespace
+    collapse), unlike `text.split()` + " ".join. Returns (chunks, word_count)
+    where word_count is used for the reported completion-token estimate.
+    """
+    return re.findall(r"\s+|\S+", text), len(text.split())
 
 
 def _ensure_slot(slot_id: int, model_id: str) -> None:
@@ -203,12 +213,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n:
+                self.rfile.read(n)
             self._send(404, {"error": "not found"}); return
         try:
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n) or b"{}")
             messages = req.get("messages", [])
-            if not messages:
+            if not isinstance(messages, list) or not messages or \
+               not all(isinstance(m, dict) for m in messages):
                 self._send(400, {"error": "messages required"}); return
 
             query  = next((m["content"] for m in reversed(messages)
@@ -240,21 +254,23 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
-                words = res.final.split()
-                for i, word in enumerate(words):
-                    self._sse_chunk(req_id, created, model,
-                                    {"content": word if i == 0 else " " + word})
+                chunks, n_words = _stream_chunks(res.final)
+                for chunk in chunks:
+                    self._sse_chunk(req_id, created, model, {"content": chunk})
                 self._sse_chunk(req_id, created, model, {}, finish_reason="stop",
                                 usage={"prompt_tokens": 0,
-                                       "completion_tokens": len(words),
-                                       "total_tokens": len(words)})
+                                       "completion_tokens": n_words,
+                                       "total_tokens": n_words})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except Exception as e:
-                err = {"error": {"message": str(e), "type": "sidecar_error"}}
-                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                try:
+                    err = {"error": {"message": str(e), "type": "sidecar_error"}}
+                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass  # client already disconnected; nothing more to send
 
         except Exception as e:
             self._send(500, {"error": str(e)})
@@ -349,6 +365,8 @@ def main():
     # Determine slot labels for instrumentation.
     if isinstance(WORKER, LiteLLMWorker):
         _slot_labels = list(WORKER.slot_models)
+    elif isinstance(WORKER, LocalPoolWorker):
+        _slot_labels = list(WORKER.names)
     else:
         _slot_labels = [f"slot-{i}" for i in range(7)]
     WORKER = _InstrumentedWorker(WORKER, _slot_labels)

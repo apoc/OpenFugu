@@ -188,7 +188,7 @@ def test_ultra_streaming_returns_sse():
     """serve_ultra: stream=True returns text/event-stream with role + content + stop events."""
     srv, port = _start_ultra_server()
     try:
-        with _ultra_globals(lambda _: CANNED_PLAN, _MockStreamWorker()):
+        with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), _MockStreamWorker()):
             resp, events = _post_stream(port, {
                 "model": "fugu-ultra",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -213,7 +213,7 @@ def test_ultra_streaming_no_workflow_warning_header():
     """serve_ultra: stream=True with unparseable plan → X-Fugu-Warning response header."""
     srv, port = _start_ultra_server()
     try:
-        with _ultra_globals(lambda _: "I cannot plan this.", _MockStreamWorker()):
+        with _ultra_globals(lambda _: ("I cannot plan this.", 0, 0), _MockStreamWorker()):
             resp, events = _post_stream(port, {
                 "model": "fugu-ultra",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -236,7 +236,7 @@ def test_ultra_non_streaming_unchanged():
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        with _ultra_globals(lambda _: CANNED_PLAN, _MockStreamWorker()):
+        with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), _MockStreamWorker()):
             data = json.dumps({
                 "model": "fugu-ultra",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -253,6 +253,92 @@ def test_ultra_non_streaming_unchanged():
     finally:
         srv.shutdown()
     print("  PASS  test_ultra_non_streaming_unchanged")
+
+
+def test_ultra_streaming_production_wiring_falls_back_safely():
+    """Regression (H1): _InstrumentedWorker always defines .stream, so stream
+    detection must check the INNER worker, not the wrapper — else a
+    non-streaming pool (MockWorker/LocalPoolWorker) crashes mid-stream in
+    production instead of taking the word-chunk fallback."""
+    srv, port = _start_ultra_server()
+    try:
+        wrapped = serve_ultra._InstrumentedWorker(ultra.MockWorker(), ultra.DEFAULT_SLOT_LABELS)
+        with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), wrapped):
+            resp, events = _post_stream(port, {
+                "model": "fugu-ultra",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            })
+        assert resp.status == 200, resp.status
+        assert events, "no SSE events received"
+        assert not any("error" in e for e in events), f"unexpected error frame: {events}"
+        content = "".join(e.get("choices", [{}])[0].get("delta", {}).get("content", "") for e in events)
+        assert content, "expected non-empty content from MockWorker fallback"
+        assert events[-1]["choices"][0]["finish_reason"] == "stop"
+    finally:
+        srv.shutdown()
+    print("  PASS  test_ultra_streaming_production_wiring_falls_back_safely")
+
+
+def test_ultra_streaming_production_wiring_streams_when_capable():
+    """When the inner worker DOES support streaming, production wiring
+    (_InstrumentedWorker-wrapped WORKER) must still take the real streaming
+    path (not the fallback) and record the slot hit."""
+    srv, port = _start_ultra_server()
+    try:
+        wrapped = serve_ultra._InstrumentedWorker(_MockStreamWorker(), ultra.DEFAULT_SLOT_LABELS)
+        with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), wrapped):
+            resp, events = _post_stream(port, {
+                "model": "fugu-ultra",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            })
+        assert resp.status == 200, resp.status
+        content = "".join(e.get("choices", [{}])[0].get("delta", {}).get("content", "") for e in events)
+        assert "final" in content and "token" in content, f"content={content!r}"
+        import urllib.request as _ur
+        workers = json.loads(_ur.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3).read())["workers"]
+        # step 1 (last, mid=1) streamed -> raw_sid=1 -> slot_id=2 (slot0=conductor)
+        streamed_slot = next((w for w in workers if w["slot_id"] == 2), None)
+        assert streamed_slot is not None and streamed_slot["hits"] >= 1, workers
+    finally:
+        srv.shutdown()
+    print("  PASS  test_ultra_streaming_production_wiring_streams_when_capable")
+
+
+MULTILINE_PLAN = """
+model_id: [0]
+subtasks: ["write code"]
+access_list: [[]]
+"""
+
+
+class _MultilineWorker:
+    """Deterministic worker returning whitespace-sensitive text (no .stream)."""
+    def __call__(self, subtask, messages, agent_id):
+        return "def f(n):\n    return n*2\n\nResult:  72"
+
+
+def test_ultra_streaming_preserves_whitespace():
+    """Regression (H2): the SSE fallback must reconstruct res.final
+    byte-for-byte, not collapse newlines/indentation/multi-space runs the way
+    str.split() + ' '.join(...) did."""
+    srv, port = _start_ultra_server()
+    try:
+        wrapped = serve_ultra._InstrumentedWorker(_MultilineWorker(), ultra.DEFAULT_SLOT_LABELS)
+        with _ultra_globals(lambda _: (MULTILINE_PLAN, 0, 0), wrapped):
+            resp, events = _post_stream(port, {
+                "model": "fugu-ultra",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            })
+        assert resp.status == 200, resp.status
+        content = "".join(e.get("choices", [{}])[0].get("delta", {}).get("content", "") for e in events)
+        expected = "def f(n):\n    return n*2\n\nResult:  72"
+        assert content == expected, f"whitespace corrupted: {content!r} != {expected!r}"
+    finally:
+        srv.shutdown()
+    print("  PASS  test_ultra_streaming_preserves_whitespace")
 
 
 # ── serve.py tests ─────────────────────────────────────────────────────────────
@@ -333,6 +419,88 @@ def test_trinity_non_streaming_unchanged():
     print("  PASS  test_trinity_non_streaming_unchanged")
 
 
+class _MultilineTrinityWorker:
+    """Deterministic worker returning whitespace-sensitive text."""
+    def __call__(self, role_name, messages, agent_id):
+        return "def f(n):\n    return n*2\n\nResult:  72"
+
+
+def test_trinity_streaming_matches_buffered_content():
+    """Regression (H2): serve.py's SSE fallback used str.split() + ' '.join,
+    which collapses newlines/indentation/multi-space runs. The concatenated
+    streamed delta.content must equal the buffered res.final exactly."""
+    labels = [f"slot-{i}" for i in range(7)]
+
+    # Buffered
+    worker_a = serve._InstrumentedWorker(_MultilineTrinityWorker(), labels)
+    srv_a, port_a = _start_trinity_server()
+    try:
+        with _trinity_globals(_MockTrinityRouter(), worker_a, max_turns=1):
+            data = json.dumps({"model": "fugu",
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            conn = http.client.HTTPConnection("127.0.0.1", port_a, timeout=30)
+            conn.request("POST", "/v1/chat/completions", body=data,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(data))})
+            buffered_body = json.loads(conn.getresponse().read())
+        buffered_content = buffered_body["choices"][0]["message"]["content"]
+    finally:
+        srv_a.shutdown()
+
+    # Streamed
+    worker_b = serve._InstrumentedWorker(_MultilineTrinityWorker(), labels)
+    srv_b, port_b = _start_trinity_server()
+    try:
+        with _trinity_globals(_MockTrinityRouter(), worker_b, max_turns=1):
+            resp, events = _post_stream(port_b, {
+                "model": "fugu",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            })
+        assert resp.status == 200, resp.status
+        streamed_content = "".join(
+            e["choices"][0]["delta"].get("content", "") for e in events)
+    finally:
+        srv_b.shutdown()
+
+    assert streamed_content == buffered_content, (
+        f"streamed != buffered: {streamed_content!r} != {buffered_content!r}")
+    print("  PASS  test_trinity_streaming_matches_buffered_content")
+
+
+def test_trinity_v1_workers_reflects_execution():
+    """serve.py /v1/workers (previously untested) must reflect real request
+    traffic: hits, model_id, and lat_hN bins after a served request."""
+    labels = [f"slot-{i}" for i in range(7)]
+    worker = serve._InstrumentedWorker(MockWorker(), labels)
+    srv, port = _start_trinity_server()
+    try:
+        with _trinity_globals(_MockTrinityRouter(), worker, max_turns=1):
+            data = json.dumps({"model": "fugu",
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            conn.request("POST", "/v1/chat/completions", body=data,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(data))})
+            conn.getresponse().read()
+
+            conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn2.request("GET", "/v1/workers")
+            resp = conn2.getresponse()
+            body = json.loads(resp.read())
+        assert resp.status == 200
+        assert body["model"] == "fugu"
+        slot0 = next((w for w in body["workers"] if w["slot_id"] == 0), None)
+        assert slot0 is not None, f"expected slot_id 0 in {body['workers']}"
+        assert slot0["hits"] >= 1, slot0
+        assert slot0["model_id"] == "slot-0", slot0
+        assert all(f"lat_h{i}" in slot0 for i in range(11)), slot0
+        assert sum(slot0[f"lat_h{i}"] for i in range(11)) >= 1, slot0
+    finally:
+        srv.shutdown()
+    print("  PASS  test_trinity_v1_workers_reflects_execution")
+
+
 # ── runner ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -346,8 +514,13 @@ if __name__ == "__main__":
         test_ultra_streaming_returns_sse,
         test_ultra_streaming_no_workflow_warning_header,
         test_ultra_non_streaming_unchanged,
+        test_ultra_streaming_production_wiring_falls_back_safely,
+        test_ultra_streaming_production_wiring_streams_when_capable,
+        test_ultra_streaming_preserves_whitespace,
         test_trinity_streaming_returns_sse,
         test_trinity_non_streaming_unchanged,
+        test_trinity_streaming_matches_buffered_content,
+        test_trinity_v1_workers_reflects_execution,
     ]
     for t in tests:
         try:

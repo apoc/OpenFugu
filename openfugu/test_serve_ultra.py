@@ -78,7 +78,7 @@ def test_normal_flow():
     Happy path: CANNED conductor output → 3-step DAG executed by MockWorker
     → HTTP 200, non-empty content, no warning header.
     """
-    with _with_globals(lambda msgs: ultra.CANNED, ultra.MockWorker()):
+    with _with_globals(lambda msgs: (ultra.CANNED, 0, 0), ultra.MockWorker()):
         srv, port = _start_server()
         try:
             resp, body = _post(port, {
@@ -101,7 +101,7 @@ def test_no_workflow_parsed():
     X-Fugu-Warning: no-workflow-parsed header; raw completion returned as content.
     """
     raw = "I cannot produce a workflow right now."
-    with _with_globals(lambda msgs: raw, ultra.MockWorker()):
+    with _with_globals(lambda msgs: (raw, 0, 0), ultra.MockWorker()):
         srv, port = _start_server()
         try:
             resp, body = _post(port, {
@@ -122,7 +122,7 @@ def test_no_workflow_parsed():
 
 def test_health_always_200():
     """GET /health always returns HTTP 200 with status=ok."""
-    with _with_globals(lambda msgs: ultra.CANNED, ultra.MockWorker()):
+    with _with_globals(lambda msgs: (ultra.CANNED, 0, 0), ultra.MockWorker()):
         srv, port = _start_server()
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -138,7 +138,7 @@ def test_health_always_200():
 
 def test_missing_messages_returns_400():
     """POST with an empty messages list → 400."""
-    with _with_globals(lambda msgs: ultra.CANNED, ultra.MockWorker()):
+    with _with_globals(lambda msgs: (ultra.CANNED, 0, 0), ultra.MockWorker()):
         srv, port = _start_server()
         try:
             resp, body = _post(port, {"messages": []})
@@ -151,7 +151,7 @@ def test_missing_messages_returns_400():
 
 def test_unknown_path_returns_404():
     """POST to an unknown path → 404."""
-    with _with_globals(lambda msgs: ultra.CANNED, ultra.MockWorker()):
+    with _with_globals(lambda msgs: (ultra.CANNED, 0, 0), ultra.MockWorker()):
         srv, port = _start_server()
         try:
             data = json.dumps({}).encode()
@@ -195,6 +195,42 @@ def test_v1_workers_returns_valid_structure():
         server.shutdown()
     print("  PASS  test_v1_workers_returns_valid_structure")
 
+
+def test_conductor_token_accounting():
+    """Conductor prompt/completion tokens from CONDUCTOR_FN are recorded and
+    surfaced via /v1/workers (regression guard: these were previously never
+    incremented and always reported 0)."""
+    import sys, threading, json, urllib.request
+    from http.server import HTTPServer
+
+    for key in [k for k in sys.modules if "serve_ultra" in k]:
+        del sys.modules[key]
+    import serve_ultra as su
+
+    su.CONDUCTOR_FN = lambda msgs: (ultra.CANNED, 17, 29)
+    su.WORKER = ultra.MockWorker()
+    su.SLOT_LABELS = ultra.DEFAULT_SLOT_LABELS
+
+    server = HTTPServer(("127.0.0.1", 0), su.Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        data = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=5).read()
+
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3)
+        w0 = json.loads(resp.read())["workers"][0]
+        assert w0["slot_id"] == 0, f"slot 0 must be conductor, got {w0['slot_id']}"
+        assert w0["prompt_tokens"] == 17, f"expected 17 prompt tokens, got {w0['prompt_tokens']}"
+        assert w0["compl_tokens"] == 29, f"expected 29 compl tokens, got {w0['compl_tokens']}"
+    finally:
+        server.shutdown()
+    print("  PASS  test_conductor_token_accounting")
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -206,4 +242,6 @@ if __name__ == "__main__":
     test_health_always_200()
     test_missing_messages_returns_400()
     test_unknown_path_returns_404()
-    print("\nAll 5 tests passed.")
+    test_v1_workers_returns_valid_structure()
+    test_conductor_token_accounting()
+    print("\nAll 7 tests passed.")

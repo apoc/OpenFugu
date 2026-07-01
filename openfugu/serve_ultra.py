@@ -21,7 +21,7 @@ Run (local conductor + local workers):
     --port 8089
 """
 from __future__ import annotations
-import argparse, json, os, sys, uuid
+import argparse, json, os, re, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,6 +66,16 @@ def _lat_bin(ms: float) -> int:
         if ms < upper:
             return i
     return 10
+
+
+def _stream_chunks(text: str) -> tuple[list[str], int]:
+    """Split text into whitespace-preserving chunks for SSE fallback streaming.
+
+    Concatenating the returned chunks reproduces `text` exactly (no whitespace
+    collapse), unlike `text.split()` + " ".join. Returns (chunks, word_count)
+    where word_count is used for the reported completion-token estimate.
+    """
+    return re.findall(r"\s+|\S+", text), len(text.split())
 
 
 def _ensure_slot(sid: int, mid: str) -> None:
@@ -152,7 +162,7 @@ class _InstrumentedWorker:
             _record_slot(raw_sid, model_id, lat_ms, 0, len(tokens), ok)
 
 # Set by main() before the server starts.
-CONDUCTOR_FN = None  # callable(messages: list[dict]) -> str
+CONDUCTOR_FN = None  # callable(messages: list[dict]) -> (str, prompt_tok, compl_tok)
 WORKER = None  # callable(subtask, messages, agent_id) -> str
 SLOT_LABELS = DEFAULT_SLOT_LABELS
 MODEL_NAME = "fugu-ultra"
@@ -255,13 +265,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n:
+                self.rfile.read(n)
             self._send(404, {"error": "not found"})
             return
         try:
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n) or b"{}")
             messages = req.get("messages", [])
-            if not messages:
+            if not isinstance(messages, list) or not messages or \
+               not all(isinstance(m, dict) for m in messages):
                 self._send(400, {"error": "messages required"})
                 return
 
@@ -274,13 +288,16 @@ class Handler(BaseHTTPRequestHandler):
 
             # ── conductor plan (always buffered) ──────────────────────────────
             _t_cond = _time.monotonic()
+            cond_ptok = cond_ctok = 0
             try:
-                completion = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
+                completion, cond_ptok, cond_ctok = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
             finally:
                 _lat_cond_ms = (_time.monotonic() - _t_cond) * 1_000
                 with _COND_LOCK:
-                    global _cond_hits, _cond_latency_ms
+                    global _cond_hits, _cond_prompt_tok, _cond_compl_tok, _cond_latency_ms
                     _cond_hits       += 1
+                    _cond_prompt_tok += cond_ptok
+                    _cond_compl_tok  += cond_ctok
                     _cond_latency_ms += int(_lat_cond_ms)
                     _cond_lat_hist[_lat_bin(_lat_cond_ms)] += 1
 
@@ -314,11 +331,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if no_wf:
                     self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
-                    words = completion.split()
-                    for i, word in enumerate(words):
-                        self._sse_chunk(req_id, created, model,
-                                        {"content": word if i == 0 else " " + word})
-                    n_words = len(words)
+                    chunks, n_words = _stream_chunks(completion)
+                    for chunk in chunks:
+                        self._sse_chunk(req_id, created, model, {"content": chunk})
                 else:
                     self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
                     tok_count: list[int] = [0]
@@ -327,7 +342,12 @@ class Handler(BaseHTTPRequestHandler):
                         tok_count[0] += 1
                         self._sse_chunk(req_id, created, model, {"content": tok})
 
-                    has_stream = hasattr(WORKER, "stream")
+                    # Detect streaming capability on the INNER worker, not the
+                    # always-.stream-defining _InstrumentedWorker wrapper — else
+                    # a non-streaming pool (MockWorker/LocalPoolWorker) crashes
+                    # mid-stream when the wrapper's .stream() delegates down.
+                    inner_worker = getattr(WORKER, "inner", WORKER)
+                    has_stream = hasattr(inner_worker, "stream")
                     res = ConductorExecutor(WORKER, slot_labels=SLOT_LABELS).execute(
                         mids, subs, acc,
                         stream_last_step=WORKER.stream if has_stream else None,
@@ -335,11 +355,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
                     if not has_stream:
-                        words = res.final.split()
-                        for i, word in enumerate(words):
-                            self._sse_chunk(req_id, created, model,
-                                            {"content": word if i == 0 else " " + word})
-                        n_words = len(words)
+                        chunks, n_words = _stream_chunks(res.final)
+                        for chunk in chunks:
+                            self._sse_chunk(req_id, created, model, {"content": chunk})
                     else:
                         n_words = tok_count[0]
 
@@ -351,10 +369,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
             except Exception as e:
-                err = {"error": {"message": str(e), "type": "sidecar_error"}}
-                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                try:
+                    err = {"error": {"message": str(e), "type": "sidecar_error"}}
+                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass  # client already disconnected; nothing more to send
 
         except Exception as e:
             self._send(500, {"error": str(e)})
@@ -427,10 +448,10 @@ def main():
         )
 
     # --- Conductor callable ---
-    # Both paths produce callable(messages: list[dict]) -> str.
+    # Both paths produce callable(messages: list[dict]) -> (str, prompt_tok, compl_tok).
     if args.local_conductor:
         cond = LocalConductor(args.local_conductor, device=args.conductor_device)
-        CONDUCTOR_FN = cond.conduct  # conduct(messages) -> str
+        CONDUCTOR_FN = cond.conduct_with_usage
         print(f"[serve_ultra] conductor: LOCAL {args.local_conductor}", flush=True)
     else:
         # LiteLLMWorker.conduct(model, messages) bumps max_tokens to 2048 for
@@ -438,7 +459,7 @@ def main():
         # else create a fresh one.
         lw = WORKER if isinstance(WORKER, LiteLLMWorker) else LiteLLMWorker()
         conductor_model = args.conductor
-        CONDUCTOR_FN = lambda msgs: lw.conduct(conductor_model, msgs)
+        CONDUCTOR_FN = lambda msgs: lw.conduct_with_usage(conductor_model, msgs)
         print(f"[serve_ultra] conductor: litellm {conductor_model}", flush=True)
 
     _cond_model_id = args.conductor or (args.local_conductor or "conductor")
