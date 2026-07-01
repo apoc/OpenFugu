@@ -8,6 +8,10 @@ Mirrors serve.py's ThreadingHTTPServer shape.  Uses ultra.py's API:
   conductor_prompt / LiteLLMWorker.conduct (or LocalConductor.conduct)
   / parse_workflow / ConductorExecutor.execute
 
+Serving-layer plumbing (per-slot metrics, SSE streaming, worker instrumentation,
+local-model pool loading, CLI/boot boilerplate) lives in serving.py, shared with
+serve.py — see that module's docstring for the split rationale.
+
 Run (litellm conductor + litellm workers):
   python serve_ultra.py \\
     --conductor openai/gpt-4o \\
@@ -21,145 +25,30 @@ Run (local conductor + local workers):
     --port 8089
 """
 from __future__ import annotations
-import argparse, json, os, re, sys, uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import argparse, json, os, sys, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ultra import (
     ConductorExecutor,
     LiteLLMWorker,
     LocalConductor,
-    LocalPoolWorker,
     MockWorker,
     conductor_prompt,
     parse_workflow,
     DEFAULT_SLOT_LABELS,
-    _parse_local_specs,  # module-level helper; same package, intentional import
 )
+from serving import (SlotMetrics, InstrumentedWorker, JsonSSEHandler,
+                     stream_chunks, build_worker_pool, run_threaded_server)
 
-import threading as _threading, time as _time
+import time as _time
 
-# ── Conductor slot (slot_id=0) ──────────────────────────────────────────────────
-_COND_LOCK       = _threading.Lock()
-_cond_hits        = 0
-_cond_prompt_tok  = 0
-_cond_compl_tok   = 0
-_cond_latency_ms  = 0
-_cond_lat_hist    = [0] * 11
-_cond_model_id    = ""  # set in main()
-
-# ── DAG execution worker slots (slot_id = internal_agent_id + 1) ───────────────
-_SLOT_LOCK    = _threading.Lock()
-_slot_hits       = {}
-_slot_prompt_tok = {}
-_slot_compl_tok  = {}
-_slot_latency_ms = {}
-_slot_lat_hist   = {}
-_slot_model_ids  = {}
-_slot_status     = {}
-
-_LAT_BINS = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 15_000, 20_000, 30_000]
-
-
-def _lat_bin(ms: float) -> int:
-    for i, upper in enumerate(_LAT_BINS):
-        if ms < upper:
-            return i
-    return 10
-
-
-def _stream_chunks(text: str) -> tuple[list[str], int]:
-    """Split text into whitespace-preserving chunks for SSE fallback streaming.
-
-    Concatenating the returned chunks reproduces `text` exactly (no whitespace
-    collapse), unlike `text.split()` + " ".join. Returns (chunks, word_count)
-    where word_count is used for the reported completion-token estimate.
-    """
-    return re.findall(r"\s+|\S+", text), len(text.split())
-
-
-def _ensure_slot(sid: int, mid: str) -> None:
-    if sid not in _slot_hits:
-        _slot_hits[sid]       = 0
-        _slot_prompt_tok[sid] = 0
-        _slot_compl_tok[sid]  = 0
-        _slot_latency_ms[sid] = 0
-        _slot_lat_hist[sid]   = [0] * 11
-        _slot_model_ids[sid]  = mid
-        _slot_status[sid]     = "ok"
-
-
-def _record_slot(sid: int, mid: str, lat_ms: float,
-                 prompt_tok: int, compl_tok: int, ok: bool) -> None:
-    with _SLOT_LOCK:
-        _ensure_slot(sid, mid)
-        _slot_hits[sid]       += 1
-        _slot_prompt_tok[sid] += prompt_tok
-        _slot_compl_tok[sid]  += compl_tok
-        _slot_latency_ms[sid] += int(lat_ms)
-        _slot_lat_hist[sid][_lat_bin(lat_ms)] += 1
-        _slot_status[sid] = "ok" if ok else "error"
-
-
-class _InstrumentedWorker:
-    """Wraps WORKER; slot_id in /v1/workers = internal_agent_id + 1 (slot 0 = conductor)."""
-    def __init__(self, inner, slot_labels):
-        self.inner       = inner
-        self.slot_labels = slot_labels
-        with _SLOT_LOCK:
-            for i, mid in enumerate(slot_labels):
-                _ensure_slot(i, mid)
-
-    def __call__(self, subtask, messages, agent_id):
-        raw_sid  = agent_id % len(self.slot_labels)
-        model_id = self.slot_labels[raw_sid]
-        t0 = _time.monotonic()
-        ok = True
-        prompt_tok = compl_tok = 0
-        try:
-            if isinstance(self.inner, LiteLLMWorker):
-                kw = dict(
-                    model=self.inner.slot_models[raw_sid],
-                    messages=[{"role": m["role"], "content": m["content"]}
-                               for m in messages],
-                    max_tokens=self.inner.max_tokens,
-                    temperature=self.inner.temperature,
-                )
-                if self.inner.api_key:  kw["api_key"]  = self.inner.api_key
-                if self.inner.api_base: kw["api_base"] = self.inner.api_base
-                r = self.inner.litellm.completion(**kw)
-                usage      = getattr(r, "usage", None) or object()
-                prompt_tok = getattr(usage, "prompt_tokens",     0) or 0
-                compl_tok  = getattr(usage, "completion_tokens", 0) or 0
-                result = r.choices[0].message.content or ""
-            else:
-                result = self.inner(subtask, messages, agent_id)
-        except Exception:
-            ok = False
-            raise
-        finally:
-            _record_slot(raw_sid, model_id,
-                         (_time.monotonic() - t0) * 1_000,
-                         prompt_tok, compl_tok, ok)
-        return result
-
-    def stream(self, subtask, messages, agent_id):
-        """Streaming variant: records total latency and token count across the call."""
-        raw_sid  = agent_id % len(self.slot_labels)
-        model_id = self.slot_labels[raw_sid]
-        t0 = _time.monotonic()
-        tokens: list[str] = []
-        ok = True
-        try:
-            for tok in self.inner.stream(subtask, messages, raw_sid):
-                tokens.append(tok)
-                yield tok
-        except Exception:
-            ok = False
-            raise
-        finally:
-            lat_ms = (_time.monotonic() - t0) * 1_000
-            _record_slot(raw_sid, model_id, lat_ms, 0, len(tokens), ok)
+# Slot 0 is reserved for the conductor (a module global — there's no wrapper
+# object to hang its metrics off). DAG worker slots live on WORKER.metrics
+# (InstrumentedWorker's own SlotMetrics) and report raw_sid + 1, read
+# dynamically in do_GET so "whatever WORKER is currently wired up" and "what
+# /v1/workers reports" can never drift apart — see serving.InstrumentedWorker.
+COND_METRICS = SlotMetrics()
+COND_METRICS.ensure(0, "")  # always listed, even before main() sets the real model_id
 
 # Set by main() before the server starts.
 CONDUCTOR_FN = None  # callable(messages: list[dict]) -> (str, prompt_tok, compl_tok)
@@ -184,35 +73,7 @@ def _chat_response(text: str, model: str, steps: int) -> dict:
     }
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _send(self, code: int, body: dict, extra_headers: dict | None = None):
-        data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        if extra_headers:
-            for k, v in extra_headers.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _sse_chunk(self, req_id: str, created: int, model: str,
-                   delta: dict, finish_reason=None, usage=None):
-        """Write one OpenAI chat.completion.chunk SSE event and flush."""
-        event: dict = {
-            "id": req_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-        }
-        if usage is not None:
-            event["usage"] = usage
-        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-        self.wfile.flush()
-
+class Handler(JsonSSEHandler):
     def do_GET(self):
         if self.path == "/v1/models":
             self._send(
@@ -227,79 +88,42 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
         elif self.path == "/v1/workers":
-            workers = []
-            # Slot 0: conductor
-            with _COND_LOCK:
-                ch = list(_cond_lat_hist)
-            workers.append({
-                "slot_id": 0, "model_id": _cond_model_id, "status": "ok",
-                "hits": _cond_hits,
-                "prompt_tokens": _cond_prompt_tok,
-                "compl_tokens":  _cond_compl_tok,
-                "total_latency_ms": _cond_latency_ms,
-                "lat_h0": ch[0],  "lat_h1": ch[1],  "lat_h2": ch[2],
-                "lat_h3": ch[3],  "lat_h4": ch[4],  "lat_h5": ch[5],
-                "lat_h6": ch[6],  "lat_h7": ch[7],  "lat_h8": ch[8],
-                "lat_h9": ch[9],  "lat_h10": ch[10],
-            })
-            # Slots 1+: DAG execution workers
-            with _SLOT_LOCK:
-                for raw_sid in sorted(_slot_hits):
-                    h = _slot_lat_hist[raw_sid]
-                    workers.append({
-                        "slot_id":          raw_sid + 1,
-                        "model_id":         _slot_model_ids[raw_sid],
-                        "status":           _slot_status[raw_sid],
-                        "hits":             _slot_hits[raw_sid],
-                        "prompt_tokens":    _slot_prompt_tok[raw_sid],
-                        "compl_tokens":     _slot_compl_tok[raw_sid],
-                        "total_latency_ms": _slot_latency_ms[raw_sid],
-                        "lat_h0": h[0],  "lat_h1": h[1],  "lat_h2": h[2],
-                        "lat_h3": h[3],  "lat_h4": h[4],  "lat_h5": h[5],
-                        "lat_h6": h[6],  "lat_h7": h[7],  "lat_h8": h[8],
-                        "lat_h9": h[9],  "lat_h10": h[10],
-                    })
+            # Slot 0: conductor, then DAG execution workers at raw_sid + 1.
+            metrics = getattr(WORKER, "metrics", None)
+            worker_rows = metrics.snapshot_rows(slot_id_offset=1) if metrics is not None else []
+            workers = COND_METRICS.snapshot_rows() + worker_rows
             self._send(200, {"model": MODEL_NAME, "workers": workers})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            if n:
-                self.rfile.read(n)
+            self._drain_body()
             self._send(404, {"error": "not found"})
             return
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            req = json.loads(self.rfile.read(n) or b"{}")
-            messages = req.get("messages", [])
-            if not isinstance(messages, list) or not messages or \
-               not all(isinstance(m, dict) for m in messages):
+            req = self._read_json_body()
+            messages = self._extract_messages(req)
+            if messages is None:
                 self._send(400, {"error": "messages required"})
                 return
 
-            query = next(
-                (m["content"] for m in reversed(messages) if m.get("role") == "user"),
-                "",
-            )
+            query = self.last_user_content(messages)
             stream = bool(req.get("stream", False))
             model  = req.get("model", MODEL_NAME)
 
             # ── conductor plan (always buffered) ──────────────────────────────
             _t_cond = _time.monotonic()
             cond_ptok = cond_ctok = 0
+            cond_ok = True
             try:
                 completion, cond_ptok, cond_ctok = CONDUCTOR_FN(conductor_prompt(query, SLOT_LABELS))
+            except Exception:
+                cond_ok = False
+                raise
             finally:
-                _lat_cond_ms = (_time.monotonic() - _t_cond) * 1_000
-                with _COND_LOCK:
-                    global _cond_hits, _cond_prompt_tok, _cond_compl_tok, _cond_latency_ms
-                    _cond_hits       += 1
-                    _cond_prompt_tok += cond_ptok
-                    _cond_compl_tok  += cond_ctok
-                    _cond_latency_ms += int(_lat_cond_ms)
-                    _cond_lat_hist[_lat_bin(_lat_cond_ms)] += 1
+                lat_cond_ms = (_time.monotonic() - _t_cond) * 1_000
+                COND_METRICS.record(0, _cond_model_id, lat_cond_ms, cond_ptok, cond_ctok, cond_ok)
 
             mids, subs, acc = parse_workflow(completion)
 
@@ -331,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if no_wf:
                     self._sse_chunk(req_id, created, model, {"role": "assistant", "content": ""})
-                    chunks, n_words = _stream_chunks(completion)
+                    chunks, n_words = stream_chunks(completion)
                     for chunk in chunks:
                         self._sse_chunk(req_id, created, model, {"content": chunk})
                 else:
@@ -343,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse_chunk(req_id, created, model, {"content": tok})
 
                     # Detect streaming capability on the INNER worker, not the
-                    # always-.stream-defining _InstrumentedWorker wrapper — else
+                    # always-.stream-defining InstrumentedWorker wrapper — else
                     # a non-streaming pool (MockWorker/LocalPoolWorker) crashes
                     # mid-stream when the wrapper's .stream() delegates down.
                     inner_worker = getattr(WORKER, "inner", WORKER)
@@ -355,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
                     if not has_stream:
-                        chunks, n_words = _stream_chunks(res.final)
+                        chunks, n_words = stream_chunks(res.final)
                         for chunk in chunks:
                             self._sse_chunk(req_id, created, model, {"content": chunk})
                     else:
@@ -369,19 +193,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
             except Exception as e:
-                try:
-                    err = {"error": {"message": str(e), "type": "sidecar_error"}}
-                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except OSError:
-                    pass  # client already disconnected; nothing more to send
+                self._sse_error_and_done(str(e))
 
         except Exception as e:
             self._send(500, {"error": str(e)})
 
-    def log_message(self, *a):
-        pass  # quiet by default
+
+_cond_model_id = ""  # set in main(); read by do_POST's COND_METRICS.record calls
 
 
 def main():
@@ -417,35 +235,11 @@ def main():
     if not args.conductor and not args.local_conductor:
         ap.error("need --conductor <litellm_id> or --local-conductor <path>")
 
-    # --- Worker pool ---
-    if args.local_models:
-        try:
-            import torch
-
-            n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        except Exception:
-            n_gpu = 0
-        specs = _parse_local_specs(args.local_models, n_gpu)
-        WORKER = LocalPoolWorker(specs)
-        SLOT_LABELS = [name for name, _, _ in specs]
-        print(
-            f"[serve_ultra] worker pool: LOCAL ({len(specs)}): {SLOT_LABELS}",
-            flush=True,
-        )
-    elif args.slot_models:
-        slots = args.slot_models.split(",")
-        WORKER = LiteLLMWorker(slot_models=slots)
-        SLOT_LABELS = slots
-        print(
-            f"[serve_ultra] worker pool: litellm ({len(slots)} slots)", flush=True
-        )
-    else:
-        WORKER = MockWorker()
-        SLOT_LABELS = DEFAULT_SLOT_LABELS
-        print(
-            "[serve_ultra] worker pool: MOCK (no --slot-models / --local-models)",
-            flush=True,
-        )
+    WORKER, SLOT_LABELS = build_worker_pool(
+        args.local_models, args.slot_models,
+        mock_worker_cls=MockWorker, litellm_worker_cls=LiteLLMWorker,
+        default_slot_labels=DEFAULT_SLOT_LABELS, log_prefix="serve_ultra",
+    )
 
     # --- Conductor callable ---
     # Both paths produce callable(messages: list[dict]) -> (str, prompt_tok, compl_tok).
@@ -463,16 +257,10 @@ def main():
         print(f"[serve_ultra] conductor: litellm {conductor_model}", flush=True)
 
     _cond_model_id = args.conductor or (args.local_conductor or "conductor")
-    _slot_labels = list(SLOT_LABELS) if SLOT_LABELS else ["slot-0"]
-    WORKER = _InstrumentedWorker(WORKER, _slot_labels)
+    COND_METRICS.ensure(0, _cond_model_id)
+    WORKER = InstrumentedWorker(WORKER, list(SLOT_LABELS))
 
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(
-        f"[serve_ultra] Fugu-Ultra listening on :{args.port} "
-        f"— POST /v1/chat/completions",
-        flush=True,
-    )
-    srv.serve_forever()
+    run_threaded_server(Handler, args.port, "serve_ultra")
 
 
 if __name__ == "__main__":

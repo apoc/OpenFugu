@@ -231,6 +231,52 @@ def test_conductor_token_accounting():
         server.shutdown()
     print("  PASS  test_conductor_token_accounting")
 
+
+def test_cond_metrics_ensure_resyncs_model_id():
+    """Regression: SlotMetrics.ensure() must refresh model_id on repeat calls,
+    not just on first insert. serve_ultra pre-registers slot 0 with a "" model
+    id at module load (so /v1/workers always lists the conductor row, even
+    before main() runs), then main() calls ensure(0, real_id) once CLI args
+    are parsed. If ensure() were a first-seen-only no-op, the conductor's
+    model_id would stay "" forever in production."""
+    from serving import SlotMetrics
+    m = SlotMetrics()
+    m.ensure(0, "")
+    assert m.snapshot_rows()[0]["model_id"] == ""
+    m.ensure(0, "gpt-5-conductor")
+    row = m.snapshot_rows()[0]
+    assert row["model_id"] == "gpt-5-conductor", row
+    assert row["hits"] == 0, "ensure() must not touch counters"
+    print("  PASS  test_cond_metrics_ensure_resyncs_model_id")
+
+
+def test_v1_workers_handles_uninstrumented_worker():
+    """Regression: GET /v1/workers must not 500 when WORKER is a raw callable
+    (no .metrics attribute) — e.g. before main() wraps it in
+    InstrumentedWorker, or in a test/script that assigns WORKER directly."""
+    import sys, threading, json, urllib.request
+    from http.server import HTTPServer
+
+    for key in [k for k in sys.modules if "serve_ultra" in k]:
+        del sys.modules[key]
+    import serve_ultra as su
+
+    su.WORKER = ultra.MockWorker()  # no .metrics — raw, uninstrumented
+
+    server = HTTPServer(("127.0.0.1", 0), su.Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert isinstance(body["workers"], list)
+    finally:
+        server.shutdown()
+    print("  PASS  test_v1_workers_handles_uninstrumented_worker")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -244,4 +290,6 @@ if __name__ == "__main__":
     test_unknown_path_returns_404()
     test_v1_workers_returns_valid_structure()
     test_conductor_token_accounting()
-    print("\nAll 7 tests passed.")
+    test_cond_metrics_ensure_resyncs_model_id()
+    test_v1_workers_handles_uninstrumented_worker()
+    print("\nAll 9 tests passed.")

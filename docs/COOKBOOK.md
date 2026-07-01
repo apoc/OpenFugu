@@ -27,8 +27,8 @@ scripts in this repo — file references are given so you can verify.
 | `--local-models` | Local HF | CSV of paths, optional `@device` | `/models/llama-3.3-8b@cuda:1,/models/gemma-3-27b@cuda:2` |
 
 - Omit both → `MockWorker` (offline stand-in; the dashboard shows mock data).
-- Pool size is **`N_AGENTS = 7`** slots (`openfugu/ultra.py:33`, `openfugu/mini.py`). Provide up to 7 models; if you give fewer, dispatch wraps with `agent_id % len(pool)` (`serve.py:107`, `serve_ultra.py:114`).
-- Local device parsing: `path@cuda:N`, else round-robin across GPUs, else `cpu` (`serve.py:345-354`, `ultra.py:_parse_local_specs`).
+- Pool size is **`N_AGENTS = 7`** slots (`openfugu/ultra.py:36`, `openfugu/mini.py`). Provide up to 7 models; if you give fewer, dispatch wraps with `agent_id % len(pool)` (`openfugu/serving.py:171` — shared by both `serve.py` and `serve_ultra.py`).
+- Local device parsing: `path@cuda:N`, else round-robin across GPUs, else `cpu` (`openfugu/serving.py:parse_local_specs` — shared by both `serve.py` and `serve_ultra.py`).
 
 ### A.2 litellm IDs for the requested frontier models
 
@@ -48,7 +48,7 @@ run a *heterogeneous* frontier pool behind one key is **OpenRouter** (`openroute
 ¹ "Open 4.8" is read here as **Claude Opus 4.8**. If you meant something else
 (e.g. an OpenAI `o`-series model), swap the ID — the mechanism is identical.
 
-**Credentials** (read by `LiteLLMWorker`, `ultra.py:230-240` / `mini.py:236-256`):
+**Credentials** (read by `LiteLLMWorker`, `ultra.py:235-243` / `mini.py:236-256`):
 
 | Env var | Used for |
 |---|---|
@@ -69,7 +69,7 @@ python openfugu/serve.py \
   --port 8088
 ```
 
-`serve.py` flags (`serve.py:319-332`): `--model` (required, Qwen3-0.6B dir),
+`serve.py` flags (`serve.py:132-147`): `--model` (required, Qwen3-0.6B dir),
 `--vector` (default `model_iter_60.npy`, the 19 456-float base = 9 216 SVF +
 10 240 head), `--head` (optional trained head-only override, 10 240 floats),
 `--slot-models`, `--local-models`, `--port` (8088), `--max-turns` (5).
@@ -93,13 +93,13 @@ python openfugu/serve_ultra.py \
   --port 8089
 ```
 
-`serve_ultra.py` flags (`serve_ultra.py:390-415`): `--conductor` (litellm ID) **or**
+`serve_ultra.py` flags (`serve_ultra.py:205-233`): `--conductor` (litellm ID) **or**
 `--local-conductor` (checkpoint path) — one is required; `--conductor-device`
 (cuda:0), `--slot-models`, `--local-models`, `--port` (8089).
 
 > **Conductor must speak the workflow DSL.** It has to emit three equal-length
 > lists `model_id: [...]`, `subtasks: [...]`, `access_list: [...]`
-> (`ultra.py:121-139`). Capable instruction-tuned frontier models do this when
+> (`ultra.py:125-142`). Capable instruction-tuned frontier models do this when
 > prompted. The repo's GRPO checkpoint (`conductor_toolscale_100`) was trained on
 > the **tool-call** DSL, not the workflow DSL, so it emits code and fails to parse
 > (`results/conductor_e2e_run.txt`) — see Part B.2 for the fix.
@@ -113,8 +113,8 @@ python openfugu/serve_ultra.py \
 | Conductor is a prompted frontier model | No training; just `--conductor <id>` |
 | Want a *small local* conductor to plan workflows | Yes — train on workflow-DSL data (B.2) |
 
-The dashboard's worker cards read `/v1/workers` (`serve.py:186-212`,
-`serve_ultra.py:216-264`), so new slot models appear automatically once served —
+The dashboard's worker cards read `/v1/workers` (`serve.py:71-74`,
+`serve_ultra.py:90-94`), so new slot models appear automatically once served —
 slot 0 on the Ultra side is the Conductor, slots 1+ are workers.
 
 ---

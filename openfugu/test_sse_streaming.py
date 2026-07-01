@@ -11,6 +11,7 @@ import ultra
 import serve_ultra
 import serve
 from mini import MockWorker
+from serving import InstrumentedWorker
 
 
 # ── SSE helpers ────────────────────────────────────────────────────────────────
@@ -256,13 +257,13 @@ def test_ultra_non_streaming_unchanged():
 
 
 def test_ultra_streaming_production_wiring_falls_back_safely():
-    """Regression (H1): _InstrumentedWorker always defines .stream, so stream
+    """Regression (H1): InstrumentedWorker always defines .stream, so stream
     detection must check the INNER worker, not the wrapper — else a
     non-streaming pool (MockWorker/LocalPoolWorker) crashes mid-stream in
     production instead of taking the word-chunk fallback."""
     srv, port = _start_ultra_server()
     try:
-        wrapped = serve_ultra._InstrumentedWorker(ultra.MockWorker(), ultra.DEFAULT_SLOT_LABELS)
+        wrapped = InstrumentedWorker(ultra.MockWorker(), ultra.DEFAULT_SLOT_LABELS)
         with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), wrapped):
             resp, events = _post_stream(port, {
                 "model": "fugu-ultra",
@@ -282,22 +283,25 @@ def test_ultra_streaming_production_wiring_falls_back_safely():
 
 def test_ultra_streaming_production_wiring_streams_when_capable():
     """When the inner worker DOES support streaming, production wiring
-    (_InstrumentedWorker-wrapped WORKER) must still take the real streaming
+    (InstrumentedWorker-wrapped WORKER) must still take the real streaming
     path (not the fallback) and record the slot hit."""
     srv, port = _start_ultra_server()
     try:
-        wrapped = serve_ultra._InstrumentedWorker(_MockStreamWorker(), ultra.DEFAULT_SLOT_LABELS)
+        wrapped = InstrumentedWorker(_MockStreamWorker(), ultra.DEFAULT_SLOT_LABELS)
         with _ultra_globals(lambda _: (CANNED_PLAN, 0, 0), wrapped):
             resp, events = _post_stream(port, {
                 "model": "fugu-ultra",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
             })
-        assert resp.status == 200, resp.status
-        content = "".join(e.get("choices", [{}])[0].get("delta", {}).get("content", "") for e in events)
-        assert "final" in content and "token" in content, f"content={content!r}"
-        import urllib.request as _ur
-        workers = json.loads(_ur.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3).read())["workers"]
+            assert resp.status == 200, resp.status
+            content = "".join(e.get("choices", [{}])[0].get("delta", {}).get("content", "") for e in events)
+            assert "final" in content and "token" in content, f"content={content!r}"
+            import urllib.request as _ur
+            # Query /v1/workers WHILE WORKER is still wired to `wrapped` — the
+            # registry is scoped to the InstrumentedWorker instance, matching
+            # production (WORKER is never swapped after main() wires it once).
+            workers = json.loads(_ur.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3).read())["workers"]
         # step 1 (last, mid=1) streamed -> raw_sid=1 -> slot_id=2 (slot0=conductor)
         streamed_slot = next((w for w in workers if w["slot_id"] == 2), None)
         assert streamed_slot is not None and streamed_slot["hits"] >= 1, workers
@@ -325,7 +329,7 @@ def test_ultra_streaming_preserves_whitespace():
     str.split() + ' '.join(...) did."""
     srv, port = _start_ultra_server()
     try:
-        wrapped = serve_ultra._InstrumentedWorker(_MultilineWorker(), ultra.DEFAULT_SLOT_LABELS)
+        wrapped = InstrumentedWorker(_MultilineWorker(), ultra.DEFAULT_SLOT_LABELS)
         with _ultra_globals(lambda _: (MULTILINE_PLAN, 0, 0), wrapped):
             resp, events = _post_stream(port, {
                 "model": "fugu-ultra",
@@ -372,7 +376,7 @@ def _start_trinity_server():
 def test_trinity_streaming_returns_sse():
     """serve.py: stream=True word-chunks res.final as SSE delta events."""
     labels = [f"slot-{i}" for i in range(7)]
-    worker = serve._InstrumentedWorker(MockWorker(), labels)
+    worker = InstrumentedWorker(MockWorker(), labels)
     srv, port = _start_trinity_server()
     try:
         with _trinity_globals(_MockTrinityRouter(), worker, max_turns=1):
@@ -398,7 +402,7 @@ def test_trinity_streaming_returns_sse():
 def test_trinity_non_streaming_unchanged():
     """serve.py: stream absent still returns buffered JSON."""
     labels = [f"slot-{i}" for i in range(7)]
-    worker = serve._InstrumentedWorker(MockWorker(), labels)
+    worker = InstrumentedWorker(MockWorker(), labels)
     srv, port = _start_trinity_server()
     try:
         with _trinity_globals(_MockTrinityRouter(), worker, max_turns=1):
@@ -432,7 +436,7 @@ def test_trinity_streaming_matches_buffered_content():
     labels = [f"slot-{i}" for i in range(7)]
 
     # Buffered
-    worker_a = serve._InstrumentedWorker(_MultilineTrinityWorker(), labels)
+    worker_a = InstrumentedWorker(_MultilineTrinityWorker(), labels)
     srv_a, port_a = _start_trinity_server()
     try:
         with _trinity_globals(_MockTrinityRouter(), worker_a, max_turns=1):
@@ -448,7 +452,7 @@ def test_trinity_streaming_matches_buffered_content():
         srv_a.shutdown()
 
     # Streamed
-    worker_b = serve._InstrumentedWorker(_MultilineTrinityWorker(), labels)
+    worker_b = InstrumentedWorker(_MultilineTrinityWorker(), labels)
     srv_b, port_b = _start_trinity_server()
     try:
         with _trinity_globals(_MockTrinityRouter(), worker_b, max_turns=1):
@@ -472,7 +476,7 @@ def test_trinity_v1_workers_reflects_execution():
     """serve.py /v1/workers (previously untested) must reflect real request
     traffic: hits, model_id, and lat_hN bins after a served request."""
     labels = [f"slot-{i}" for i in range(7)]
-    worker = serve._InstrumentedWorker(MockWorker(), labels)
+    worker = InstrumentedWorker(MockWorker(), labels)
     srv, port = _start_trinity_server()
     try:
         with _trinity_globals(_MockTrinityRouter(), worker, max_turns=1):
@@ -501,6 +505,21 @@ def test_trinity_v1_workers_reflects_execution():
     print("  PASS  test_trinity_v1_workers_reflects_execution")
 
 
+def test_trinity_v1_workers_handles_uninstrumented_worker():
+    """Regression: serve.py's GET /v1/workers must not 500 when WORKER is a
+    raw callable with no .metrics attribute (e.g. mid-startup or a script
+    that assigns WORKER directly, bypassing InstrumentedWorker)."""
+    srv, port = _start_trinity_server()
+    try:
+        with _trinity_globals(_MockTrinityRouter(), MockWorker(), max_turns=1):
+            import urllib.request as _ur
+            body = json.loads(_ur.urlopen(f"http://127.0.0.1:{port}/v1/workers", timeout=3).read())
+        assert isinstance(body["workers"], list)
+    finally:
+        srv.shutdown()
+    print("  PASS  test_trinity_v1_workers_handles_uninstrumented_worker")
+
+
 # ── runner ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -521,6 +540,7 @@ if __name__ == "__main__":
         test_trinity_non_streaming_unchanged,
         test_trinity_streaming_matches_buffered_content,
         test_trinity_v1_workers_reflects_execution,
+        test_trinity_v1_workers_handles_uninstrumented_worker,
     ]
     for t in tests:
         try:

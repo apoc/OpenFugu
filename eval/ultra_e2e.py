@@ -22,8 +22,8 @@ import argparse, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "openfugu"))
 sys.path.insert(0, "/root")
 import ultra
-from ultra import (LocalConductor, LocalPoolWorker, ConductorExecutor,
-                   conductor_prompt, parse_workflow, _parse_local_specs)
+from ultra import LocalConductor, ConductorExecutor, conductor_prompt, parse_workflow
+from serving import LocalPoolWorker, parse_local_specs
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
         n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     except Exception:
         n_gpu = 0
-    specs = _parse_local_specs(args.local_models, n_gpu)
+    specs = parse_local_specs(args.local_models, n_gpu)
     print(f"[ultra-e2e] workers LOCAL ({len(specs)}): {[n for n,_,_ in specs]}", flush=True)
     worker = LocalPoolWorker(specs)
     slot_labels = [n for n, _, _ in specs]
